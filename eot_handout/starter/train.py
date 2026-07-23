@@ -203,17 +203,16 @@ def extract_features(x, sr, pause_start, turn_context=None):
     else:
         f0_var_rel = 0.0
 
-    # ====================================================================== #
-    # FEATURE 3 — Energy decay slope into the pause (last ~400 ms, dB/frame) #
-    # Smooth decay to near-silence → negative slope → EOT.                   #
-    # Hold pauses from mid-utterance cutoffs often have moderate residual     #
-    # energy → slope is less steep or even flat/positive.                    #
-    # EDGE CASE D: < 3 frames → 0.0 fallback.                                #
-    # ====================================================================== #
-    n_decay  = max(1, int(0.40 / HOP_S))    # ~40 frames
-    e_decay  = e_db[-n_decay:]
-    xi_decay = np.arange(len(e_decay), dtype=float)
-    energy_slope = _safe_polyfit_slope(xi_decay, e_decay)
+    # ITER 2 FIX: 400ms slope was too wide — it averaged early-stable and
+    # late-dropping energy together, losing the terminal drop signal.
+    # Worst-FN analysis: all top-10 errors had steep decays (-1.4 to -1.9
+    # dB/frame) that were diluted by the 400ms window. Use last-200ms drop
+    # vs preceding-200ms instead: positive = energy fell sharply at end = EOT.
+    n_half  = max(1, int(0.20 / HOP_S))           # ~20 frames = 200ms
+    mid_e   = e_db[-2*n_half:-n_half] if len(e_db) >= 2*n_half else e_db[:max(1,len(e_db)//2)]
+    tail_e  = e_db[-n_half:]          if len(e_db) >= n_half   else e_db
+    # energy_slope: positive = drop, negative = rise (note: sign flipped vs old slope convention)
+    energy_slope = float(mid_e.mean() - tail_e.mean()) if len(mid_e) > 0 and len(tail_e) > 0 else 0.0
 
     # ====================================================================== #
     # FEATURE 4 — Residual energy at pause_start, relative to window mean    #
@@ -246,7 +245,7 @@ def extract_features(x, sr, pause_start, turn_context=None):
     FILLER_DUR_THRESH_S = 0.20    # relative, not about Hz
     # Low var in both pitch and energy AND sustained pitch = filler candidate
     is_flat_pitch  = float(f0_var_rel < 0.005)   # relative threshold
-    is_flat_energy = float(energy_var_tail < 10.0)  # dB² — absolute but generous
+    is_flat_energy = float(energy_var_tail < 200.0)  # dB² — was 10.0 (never fired); data mean ~280
     is_long_voiced = float(last_run_dur >= FILLER_DUR_THRESH_S)
     filler_score   = is_flat_pitch * is_flat_energy * is_long_voiced
 
@@ -260,11 +259,15 @@ def extract_features(x, sr, pause_start, turn_context=None):
     if len(seg_durations) > 0:
         avg_seg_dur = float(np.mean(seg_durations))
     else:
-        # First pause — no prior data. Use the current seg if available,
-        # so ratio = 1.0 (by definition, last = average).
-        avg_seg_dur = last_run_dur if last_run_dur > 1e-6 else HOP_S * 10
+        # ITER 3 FIX: old fallback made ratio=1.0 always for pause_index=0 (no signal).
+        # Worst-FN analysis showed all top-10 errors were pause_index=0 where the
+        # model received a neutral '1.0' regardless of actual last-segment length.
+        # Fix: use a fixed typical syllable duration (150ms) as reference so
+        # lengthening_ratio is informative even with no prior segment history.
+        TYPICAL_SYL_DUR_S = 0.15   # ~150ms, typical conversational syllable
+        avg_seg_dur = TYPICAL_SYL_DUR_S
 
-    lengthening_ratio = last_run_dur / (avg_seg_dur + 1e-6)
+    lengthening_ratio = float(np.clip(last_run_dur / (avg_seg_dur + 1e-6), 0.0, 4.0))
 
     # ====================================================================== #
     # FEATURE 8 — Voicing density / speaking rate in window                   #
@@ -390,7 +393,7 @@ def main():
             f0  = f0_contour(seg, sr)
             seg_durations.extend(_voiced_seg_durations(f0))
             voiced_s_so_far += float((f0 > 0).sum()) * HOP_S
-            total_s_so_far  += pause_start
+            total_s_so_far  = pause_start
 
     X, y = np.array(X), np.array(y)
 
