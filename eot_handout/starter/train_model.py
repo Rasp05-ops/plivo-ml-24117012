@@ -1,65 +1,154 @@
-"""train_model.py — train EOT detector on English + Hindi combined.
+"""train_model.py — fit and save the EOT classifier.
+
+Imports extract_features() and helpers directly from train.py (unchanged).
 
 Usage
 -----
-    python train_model.py [--data_root ../eot_data] [--out eot_model.joblib]
-                          [--model {logreg,gbt,both}] [--val_frac 0.25]
-                          [--random_state 42]
+    # Train on a single language:
+    python train_model.py --data_dir ../eot_data/english --out eot_model.joblib
+
+    # Train on both (run twice and compare, or extend --data_dir to accept multiple):
+    python train_model.py --data_dir ../eot_data/english ../eot_data/hindi --out eot_model.joblib
 
 Output
 ------
-  <out>          joblib bundle: {model, feature_names, random_state, meta}
-  stdout         holdout accuracy, AUC, per-language mean delay @5% cutoff
-
-Raises loudly if eot_data/english or eot_data/hindi are missing.
+  <out>  joblib bundle: {model, feature_names, feature_dim, random_state}
 """
 import argparse
+import csv
 import os
 import sys
-import warnings
+from collections import defaultdict
 
 import joblib
 import numpy as np
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GroupShuffleSplit
 
-# shared feature pipeline — single source of truth
-from feature_extractor import (
-    FEATURE_NAMES, FEATURE_DIM, build_feature_matrix
+# ── import the validated feature extractor and helpers from train.py (unchanged) ──
+from train import (
+    extract_features,
+    _voiced_seg_durations,
+    HOP_S,
 )
+from features import load_wav, speech_before, f0_contour
 
-# import scorer logic if available
-try:
-    from score import evaluate, THRESHOLDS, DELAYS, TIMEOUT_S
-    _SCORER_OK = True
-except ImportError:
-    _SCORER_OK = False
-    warnings.warn("score.py not importable; per-language delay scores not reported.")
-
+# feature order must stay in sync with extract_features() in train.py
+FEATURE_NAMES = [
+    "f0_slope_rel",        #  0
+    "f0_rise_fall",        #  1
+    "f0_var_rel",          #  2
+    "energy_slope",        #  3
+    "energy_residual_rel", #  4
+    "energy_var_tail",     #  5
+    "filler_score",        #  6
+    "lengthening_ratio",   #  7
+    "voicing_density",     #  8
+    "pause_index_norm",    #  9
+    "turn_voicing_ratio",  # 10
+    "energy_mean_db",      # 11
+    "f0_range_rel",        # 12
+    "final_voiced_dur",    # 13
+    "voiced_frame_count",  # 14
+    "pause_start_s",       # 15
+]
+FEATURE_DIM = 16
 RANDOM_STATE = 42
 
 
-# ── scorer helper ─────────────────────────────────────────────────────────── #
+# ── data loader — same causal accumulator as train.py's main() ───────────── #
 
-def _mean_delay_at_budget(meta_val, p_val, budget=0.05):
-    """Compute best mean response delay @ <=budget interrupted-turn rate.
+def load_data(data_dir, require_label=True):
+    """Load features and labels from one data_dir folder.
 
-    meta_val : list of pause dicts (turn_id, pause_end, pause_start, label)
-    p_val    : array of predicted p_eot for those pauses
+    Returns X (n, 16), y (n,) or None, groups (n,), keys (n,).
     """
-    if not _SCORER_OK:
-        return None, None
+    labels_path = os.path.join(data_dir, "labels.csv")
+    if not os.path.exists(labels_path):
+        sys.exit(f"ERROR: labels.csv not found in '{data_dir}'")
 
-    pauses = []
-    for m, p in zip(meta_val, p_val):
-        pauses.append({
-            "turn_id": m["turn_id"],
-            "dur"    : m["pause_end"] - m["pause_start"],
-            "label"  : m["label"],
-            "p"      : float(p),
-        })
+    rows = list(csv.DictReader(open(labels_path, newline="")))
+    has_label = "label" in (rows[0] if rows else {})
+    if require_label and not has_label:
+        sys.exit(f"ERROR: 'label' column missing in {labels_path}")
+
+    turn_rows = defaultdict(list)
+    for r in rows:
+        turn_rows[r["turn_id"]].append(r)
+    for tid in turn_rows:
+        turn_rows[tid].sort(key=lambda r: int(r["pause_index"]))
+
+    cache = {}
+    X, y_list, groups, keys = [], [], [], []
+
+    for tid, t_rows in turn_rows.items():
+        seg_durations   = []
+        voiced_s_so_far = 0.0
+        total_s_so_far  = 0.0
+
+        for pause_idx, r in enumerate(t_rows):
+            path = os.path.join(data_dir, r["audio_file"])
+            if path not in cache:
+                cache[path] = load_wav(path)
+            x_wav, sr = cache[path]
+            pause_start = float(r["pause_start"])
+
+            ctx = {
+                "pause_index"     : pause_idx,
+                "seg_durations"   : list(seg_durations),
+                "voiced_s_so_far" : voiced_s_so_far,
+                "total_s_so_far"  : total_s_so_far,
+            }
+            feat = extract_features(x_wav, sr, pause_start, ctx)
+            X.append(feat)
+            groups.append(tid)
+            keys.append((r["turn_id"], r["pause_index"]))
+            if has_label:
+                y_list.append(1 if r["label"] == "eot" else 0)
+
+            # update context AFTER extracting — strictly causal
+            seg = speech_before(x_wav, sr, pause_start, window_s=1.5)
+            f0  = f0_contour(seg, sr)
+            seg_durations.extend(_voiced_seg_durations(f0))
+            voiced_s_so_far += float((f0 > 0).sum()) * HOP_S
+            total_s_so_far   = pause_start   # mirror train.py's accumulator exactly
+
+    X_mat = np.array(X, dtype=np.float32)
+    y_arr = np.array(y_list, dtype=int) if y_list else None
+    nan_ct = int(np.sum(~np.isfinite(X_mat)))
+    if nan_ct:
+        print(f"WARNING: {nan_ct} non-finite values in feature matrix for {data_dir}")
+    return X_mat, y_arr, groups, keys
+
+
+# ── AUC helper ───────────────────────────────────────────────────────────── #
+
+def _auc(y_true, scores):
+    order = np.argsort(scores)
+    ranks = np.empty_like(order, dtype=float)
+    ranks[order] = np.arange(1, len(scores) + 1)
+    n1, n0 = int(y_true.sum()), int((1 - y_true).sum())
+    if n1 == 0 or n0 == 0:
+        return float("nan")
+    return float((ranks[y_true == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
+
+
+# ── scorer (mirrors score.py logic) ─────────────────────────────────────── #
+
+def _mean_delay_at_budget(meta_rows, p_val, budget=0.05):
+    """Best mean response delay achievable at <= budget interrupted-turn rate.
+    meta_rows: list of {turn_id, pause_end, pause_start, label}
+    """
+    try:
+        from score import evaluate, THRESHOLDS, DELAYS, TIMEOUT_S
+    except ImportError:
+        return None, {}
+
+    pauses = [{"turn_id": m["turn_id"],
+               "dur"    : m["pause_end"] - m["pause_start"],
+               "label"  : m["label"],
+               "p"      : float(p)} for m, p in zip(meta_rows, p_val)]
 
     best = None
     for t in THRESHOLDS:
@@ -73,181 +162,125 @@ def _mean_delay_at_budget(meta_val, p_val, budget=0.05):
     return best["lat"], best
 
 
-def _auc(y_true, scores):
-    order = np.argsort(scores)
-    ranks = np.empty_like(order, dtype=float)
-    ranks[order] = np.arange(1, len(scores) + 1)
-    n1 = y_true.sum(); n0 = len(y_true) - n1
-    if n1 == 0 or n0 == 0:
-        return float("nan")
-    return float((ranks[y_true == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
-
-
-# ── build classifier ──────────────────────────────────────────────────────── #
-
-def _make_calibrated(kind, random_state):
-    if kind == "logreg":
-        base = LogisticRegression(
-            class_weight="balanced", max_iter=2000, random_state=random_state
-        )
-    else:  # gbt
-        base = GradientBoostingClassifier(
-            n_estimators=200, max_depth=3, random_state=random_state,
-            subsample=0.8, learning_rate=0.05,
-        )
-    return CalibratedClassifierCV(base, method="isotonic", cv=5)
-
-
 # ── main ──────────────────────────────────────────────────────────────────── #
 
 def main():
-    ap = argparse.ArgumentParser(description="Train EOT model on English + Hindi")
-    ap.add_argument("--data_root", default=os.path.join(os.path.dirname(__file__),
-                                                         "..", "eot_data"),
-                    help="Path that contains english/ and hindi/ subdirectories.")
-    ap.add_argument("--out", default="eot_model.joblib",
-                    help="Path to save the model bundle.")
-    ap.add_argument("--model", choices=["logreg", "gbt", "both"], default="both",
-                    help="Which model(s) to train; 'both' picks the one with higher val AUC.")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_dir", nargs="+", required=True,
+                    help="One or more data dirs (e.g. ../eot_data/english ../eot_data/hindi)")
+    ap.add_argument("--out", default="eot_model.joblib")
     ap.add_argument("--val_frac", type=float, default=0.25)
     ap.add_argument("--random_state", type=int, default=RANDOM_STATE)
     args = ap.parse_args()
 
     rs = args.random_state
+    print(f"feature_names : {FEATURE_NAMES}")
+    print(f"feature_dim   : {FEATURE_DIM}")
+    print(f"random_state  : {rs}\n")
 
-    # ── locate language folders ───────────────────────────────────────────── #
-    lang_dirs = {}
-    for lang in ("english", "hindi"):
-        d = os.path.join(args.data_root, lang)
+    # ── check all data dirs exist before loading anything ────────────────── #
+    for d in args.data_dir:
         if not os.path.isdir(d):
-            sys.exit(
-                f"ERROR: expected '{d}' but directory not found.\n"
-                f"Check --data_root (currently '{args.data_root}')."
-            )
-        lang_dirs[lang] = d
-    print(f"Data root  : {os.path.abspath(args.data_root)}")
-    print(f"Languages  : {list(lang_dirs.keys())}")
-    print(f"Features   : {FEATURE_DIM}  ({FEATURE_NAMES})")
-    print(f"Random state: {rs}")
-    print()
+            sys.exit(f"ERROR: data directory not found: '{d}'")
 
-    # ── load and combine ──────────────────────────────────────────────────── #
-    all_X, all_y, all_groups, all_meta, all_lang = [], [], [], [], []
-    lang_slices = {}   # lang -> (start_idx, end_idx)
+    # ── load and combine all data dirs ───────────────────────────────────── #
+    all_X, all_y, all_groups, all_meta = [], [], [], []
+    lang_idx = {}   # lang_name → list of row indices in the combined set
 
-    for lang, d in lang_dirs.items():
-        print(f"Loading {lang} ...", end=" ", flush=True)
-        X, keys, y, groups, meta = build_feature_matrix(d, require_labels=True)
-        print(f"{len(y)} pauses  "
-              f"(eot={y.sum()}, hold={len(y)-y.sum()})  "
-              f"finite={np.all(np.isfinite(X))}")
+    for data_dir in args.data_dir:
+        lang = os.path.basename(data_dir.rstrip("/"))
+        print(f"Loading {lang} ({data_dir}) ...", end=" ", flush=True)
+        X, y, groups, keys = load_data(data_dir, require_label=True)
+
+        # rebuild meta for scoring
+        labels_path = os.path.join(data_dir, "labels.csv")
+        meta_rows_raw = list(csv.DictReader(open(labels_path, newline="")))
+        meta_by_key = {(r["turn_id"], r["pause_index"]): r for r in meta_rows_raw}
 
         start = len(all_X)
+        for i, (key, feat, label) in enumerate(zip(keys, X, y)):
+            raw = meta_by_key.get(key, {})
+            all_meta.append({
+                "turn_id"    : raw.get("turn_id", ""),
+                "pause_start": float(raw.get("pause_start", 0)),
+                "pause_end"  : float(raw.get("pause_end", 0)),
+                "label"      : raw.get("label", ""),
+            })
         all_X.extend(X)
         all_y.extend(y)
         all_groups.extend([f"{lang}__{g}" for g in groups])
-        all_meta.extend(meta)
-        all_lang.extend([lang] * len(y))
-        lang_slices[lang] = (start, len(all_X))
+        lang_idx[lang] = list(range(start, len(all_X)))
+        print(f"{len(y)} pauses  (eot={y.sum()}, hold={len(y)-y.sum()})  finite={np.all(np.isfinite(X))}")
 
     X_all  = np.array(all_X, dtype=np.float32)
     y_all  = np.array(all_y, dtype=int)
-    lang_arr = np.array(all_lang)
-    print(f"\nCombined   : {len(y_all)} pauses  "
-          f"(eot={y_all.sum()}, hold={len(y_all)-y_all.sum()})")
-    print(f"Feature matrix finite: {np.all(np.isfinite(X_all))}")
-    print()
+    print(f"\nCombined: {len(y_all)} pauses  (eot={y_all.sum()}, hold={len(y_all)-y_all.sum()})\n")
 
-    # ── GroupShuffleSplit on turn_id ──────────────────────────────────────── #
-    splitter = GroupShuffleSplit(
-        n_splits=1, test_size=args.val_frac, random_state=rs
-    )
+    # ── GroupShuffleSplit keyed on turn_id (never splits a turn) ─────────── #
+    splitter = GroupShuffleSplit(n_splits=1, test_size=args.val_frac,
+                                 random_state=rs)
     tr_idx, va_idx = next(splitter.split(X_all, y_all, all_groups))
+    va_set = set(va_idx)
 
     X_tr, y_tr = X_all[tr_idx], y_all[tr_idx]
     X_va, y_va = X_all[va_idx], y_all[va_idx]
-    meta_va   = [all_meta[i] for i in va_idx]
-    lang_va   = lang_arr[va_idx]
+    meta_va = [all_meta[i] for i in va_idx]
+    print(f"Train: {len(tr_idx)} | Val: {len(va_idx)}")
+    for lang, idxs in lang_idx.items():
+        n_val = sum(1 for i in idxs if i in va_set)
+        print(f"  val {lang}: {n_val} pauses")
 
-    print(f"Train: {len(tr_idx)} pauses | Val: {len(va_idx)} pauses")
-    for lang in lang_dirs:
-        n = (lang_va == lang).sum()
-        print(f"  val {lang}: {n} pauses")
+    # ── train calibrated logistic regression ─────────────────────────────── #
+    print("\nFitting CalibratedClassifierCV(LogisticRegression) ...")
+    base = LogisticRegression(class_weight="balanced", max_iter=2000,
+                               random_state=rs)
+    clf = CalibratedClassifierCV(base, method="isotonic", cv=5)
+    clf.fit(X_tr, y_tr)
 
-    # ── train models ─────────────────────────────────────────────────────── #
-    candidates = [args.model] if args.model != "both" else ["logreg", "gbt"]
-    results = {}
+    p_va  = clf.predict_proba(X_va)[:, 1]
+    acc   = float((clf.predict(X_va) == y_va).mean())
+    auc   = _auc(y_va, p_va)
+    chance = max(float(y_va.mean()), 1 - float(y_va.mean()))
+    print(f"  val accuracy : {acc:.3f}  (chance {chance:.3f})")
+    print(f"  val AUC      : {auc:.3f}")
 
-    for kind in candidates:
-        print(f"\n── Training {kind} ...")
-        clf = _make_calibrated(kind, rs)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            clf.fit(X_tr, y_tr)
+    # overall delay score
+    lat, best = _mean_delay_at_budget(meta_va, p_va)
+    if lat is not None:
+        print(f"  val mean delay @5% (overall) : {lat*1000:.0f} ms"
+              f"  [t={best['t']}, d={best['d']*1000:.0f}ms,"
+              f" interrupted={best['cut']*100:.1f}%]")
 
-        p_va = clf.predict_proba(X_va)[:, 1]
-        acc  = float((clf.predict(X_va) == y_va).mean())
-        auc  = _auc(y_va, p_va)
-        print(f"   val  accuracy : {acc:.3f}  (chance {max(y_va.mean(), 1-y_va.mean()):.3f})")
-        print(f"   val  AUC      : {auc:.3f}")
+    # per-language delay score
+    for lang, idxs in lang_idx.items():
+        va_lang = [i for i in idxs if i in va_set]
+        if not va_lang:
+            continue
+        local_pos = [list(va_idx).index(i) for i in va_lang]
+        meta_l = [meta_va[p] for p in local_pos]
+        p_l    = p_va[local_pos]
+        y_l    = y_va[local_pos]
+        lat_l, _ = _mean_delay_at_budget(meta_l, p_l)
+        auc_l    = _auc(y_l, p_l)
+        if lat_l is not None:
+            print(f"  val mean delay @5% ({lang:7s}) : {lat_l*1000:.0f} ms  AUC={auc_l:.3f}")
+        else:
+            print(f"  val AUC ({lang}): {auc_l:.3f}")
 
-        # overall score.py metric
-        lat_all, best_all = _mean_delay_at_budget(meta_va, p_va)
-        if lat_all is not None:
-            print(f"   val  mean delay @5% cutoff (overall) : {lat_all*1000:.0f} ms"
-                  f"  [t={best_all['t']}, d={best_all['d']*1000:.0f}ms, "
-                  f"interrupted={best_all['cut']*100:.1f}%]")
+    # ── refit on everything, then save ───────────────────────────────────── #
+    print("\nRefitting on full combined dataset ...")
+    clf.fit(X_all, y_all)
 
-        # per-language score
-        for lang in lang_dirs:
-            mask = lang_va == lang
-            if mask.sum() == 0:
-                continue
-            meta_l = [m for m, ml in zip(meta_va, lang_va) if ml == lang]
-            p_l    = p_va[mask]
-            y_l    = y_va[mask]
-            lat_l, best_l = _mean_delay_at_budget(meta_l, p_l)
-            auc_l  = _auc(y_l, p_l)
-            if lat_l is not None:
-                print(f"   val  mean delay @5% ({lang:7s}) : {lat_l*1000:.0f} ms"
-                      f"  AUC={auc_l:.3f}  n={mask.sum()}")
-            else:
-                print(f"   val  AUC ({lang}): {auc_l:.3f}  n={mask.sum()}")
-
-        results[kind] = {"clf": clf, "auc": auc, "lat": lat_all}
-
-    # ── pick best model if both ───────────────────────────────────────────── #
-    if len(results) == 2:
-        best_kind = max(results, key=lambda k: results[k]["auc"])
-        print(f"\n── Selecting '{best_kind}' (higher val AUC: "
-              f"{results[best_kind]['auc']:.3f})")
-    else:
-        best_kind = candidates[0]
-
-    final_clf = results[best_kind]["clf"]
-
-    # Refit on ALL data for deployment
-    print(f"\n── Refitting '{best_kind}' on full combined data ...")
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        final_clf.fit(X_all, y_all)
-
-    # ── save model bundle ─────────────────────────────────────────────────── #
     bundle = {
-        "model"        : final_clf,
+        "model"        : clf,
         "feature_names": FEATURE_NAMES,
         "feature_dim"  : FEATURE_DIM,
         "random_state" : rs,
-        "model_kind"   : best_kind,
-        "trained_on"   : list(lang_dirs.keys()),
+        "trained_on"   : list(lang_idx.keys()),
     }
-    out_path = args.out
-    joblib.dump(bundle, out_path)
-    print(f"\n── Saved model bundle → {os.path.abspath(out_path)}")
-    print(f"   feature_names : {FEATURE_NAMES}")
-    print(f"   model kind    : {best_kind}")
-    print(f"   trained on    : {bundle['trained_on']}")
-    print("\nDone. Add the above val delay numbers to RUNLOG.md.")
+    joblib.dump(bundle, args.out)
+    print(f"Saved model bundle → {os.path.abspath(args.out)}")
+    print("Paste the above val numbers into RUNLOG.md.")
 
 
 if __name__ == "__main__":
