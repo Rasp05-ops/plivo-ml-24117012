@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -13,29 +14,79 @@
             margin: 0 auto;
             padding: 2rem;
         }
-        h1, h2, h3 { color: #1a1a1a; }
-        h1 { border-bottom: 2px solid #eaeaea; padding-bottom: 0.5rem; }
-        h2 { margin-top: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 0.3rem; }
-        .success { color: #007600; font-weight: bold; }
-        table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
-        th, td { padding: 0.75rem; text-align: left; border-bottom: 1px solid #ddd; }
-        th { background-color: #f7f7f7; }
-        .box { background: #f9f9f9; border-left: 4px solid #0056b3; padding: 1rem; margin: 1rem 0; }
-        pre { background: #f4f4f4; padding: 1rem; border-radius: 4px; overflow-x: auto; }
-        ul { margin-bottom: 1rem; }
+
+        h1,
+        h2,
+        h3 {
+            color: #1a1a1a;
+        }
+
+        h1 {
+            border-bottom: 2px solid #eaeaea;
+            padding-bottom: 0.5rem;
+        }
+
+        h2 {
+            margin-top: 2rem;
+            border-bottom: 1px solid #eaeaea;
+            padding-bottom: 0.3rem;
+        }
+
+        .success {
+            color: #007600;
+            font-weight: bold;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1rem 0;
+        }
+
+        th,
+        td {
+            padding: 0.75rem;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+
+        th {
+            background-color: #f7f7f7;
+        }
+
+        .box {
+            background: #f9f9f9;
+            border-left: 4px solid #0056b3;
+            padding: 1rem;
+            margin: 1rem 0;
+        }
+
+        pre {
+            background: #f4f4f4;
+            padding: 1rem;
+            border-radius: 4px;
+            overflow-x: auto;
+        }
+
+        ul {
+            margin-bottom: 1rem;
+        }
     </style>
 </head>
+
 <body>
 
     <h1>End-of-Turn (EOT) Detection Solution</h1>
-    
+
     <div class="box">
-        <strong>Goal:</strong> Detect if a user has finished speaking at a given pause, using exclusively causal acoustic features, achieving &lt;1600ms mean response delay at a 5% false-cutoff rate.
+        <strong>Goal:</strong> Detect if a user has finished speaking at a given pause, using exclusively causal
+        acoustic features, achieving &lt;1600ms mean response delay at a 5% false-cutoff rate.
     </div>
 
     <h2>1. Results Summary</h2>
-    <p>The model successfully surpasses the 1600ms silence-only baseline on both validation datasets, operating safely within laptop CPU constraints.</p>
-    
+    <p>The model successfully surpasses the 1600ms silence-only baseline on both validation datasets, operating safely
+        within laptop CPU constraints.</p>
+
     <table>
         <thead>
             <tr>
@@ -60,16 +111,24 @@
             </tr>
         </tbody>
     </table>
-    <p><em>(Note: Final locked model is an out-of-sample calibrated Pipeline, meaning these in-sample score.py numbers are highly robust and not artificially over-fitted.)</em></p>
+    <p><em>(Note: Final locked model is an out-of-sample calibrated Pipeline, meaning these in-sample score.py numbers
+            are highly robust and not artificially over-fitted.)</em></p>
 
     <h2>2. Implementation Architecture</h2>
-    <p>Our solution implements a lightweight, calibrated <strong>Logistic Regression</strong> model relying entirely on explicitly engineered prosodic features.</p>
+    <p>Our solution implements a lightweight, calibrated <strong>Logistic Regression</strong> model relying entirely on
+        explicitly engineered prosodic features.</p>
 
     <ul>
-        <li><strong>Causality Enforced:</strong> Strict architectural gatekeeping via <code>speech_before()</code> ensures no audio frame $\ge$ <code>pause_start</code> is ever accessed.</li>
-        <li><strong>Feature Engineering:</strong> Extracted 15 normalized features per pause, tracking <em>pitch (F0) slopes, energy drop, final segment lengthening, voicing density, and pause context</em>.</li>
-        <li><strong>Machine Learning Pipeline:</strong> <code>Pipeline(drop_pause_start_s, StandardScaler, LogisticRegression(C=0.1, class_weight=None))</code>.</li>
-        <li><strong>Cross-lingual Training:</strong> The model was trained concurrently on combined English and Hindi sets (496 total pauses) using a robust <code>GroupShuffleSplit</code> tied to <code>turn_id</code> to prevent target leakage.</li>
+        <li><strong>Causality Enforced:</strong> Strict architectural gatekeeping via <code>speech_before()</code>
+            ensures no audio frame $\ge$ <code>pause_start</code> is ever accessed.</li>
+        <li><strong>Feature Engineering:</strong> Extracted 15 normalized features per pause, tracking <em>pitch (F0)
+                slopes, energy drop, final segment lengthening, voicing density, and pause context</em>.</li>
+        <li><strong>Machine Learning Pipeline:</strong>
+            <code>Pipeline(drop_pause_start_s, StandardScaler, LogisticRegression(C=0.1, class_weight=None))</code>.
+        </li>
+        <li><strong>Cross-lingual Training:</strong> The model was trained concurrently on combined English and Hindi
+            sets (496 total pauses) using a robust <code>GroupShuffleSplit</code> tied to <code>turn_id</code> to
+            prevent target leakage.</li>
     </ul>
 
     <h2>3. Human vs AI Co-pilot Contribution</h2>
@@ -84,13 +143,21 @@
             <tr>
                 <td><strong>Human</strong></td>
                 <td>
-                    Directed iterative debugging constraints. Recognized that in-sample scoring was masking overfitting issues. Enforced a true held-out validation step, guided the switch from <code>CalibratedClassifierCV(class_weight='balanced')</code> to standard <code>class_weight=None</code> smoothing. Prompted the error-driven Iteration 1-3 diagnostics.
+                    Directed iterative debugging constraints. Recognized that in-sample scoring was masking overfitting
+                    issues. Enforced a true held-out validation step, guided the switch from
+                    <code>CalibratedClassifierCV(class_weight='balanced')</code> to standard
+                    <code>class_weight=None</code> smoothing. Conducted code review and identified dangerous code
+                    duplication (the causal accumulator loop) across scripts, forcing a modular refactoring. Prompted
+                    the error-driven Iteration 1-3 diagnostics.
                 </td>
             </tr>
             <tr>
                 <td><strong>AI</strong></td>
                 <td>
-                    Wrote robust, NaN-safe array manipulation for feature extraction. Split training/prediction mechanics logically to ensure zero code duplication. Wrote the causal context accumulator loop. Identified error clusters (e.g. <code>pause_index=0</code> failures) computationally and wrote targeted feature refinements tracking energy drops and syllable normalization.
+                    Wrote robust, NaN-safe array manipulation for feature extraction. Split training/prediction
+                    mechanics logically to ensure zero code duplication. Wrote the causal context accumulator loop.
+                    Identified error clusters (e.g. <code>pause_index=0</code> failures) computationally and wrote
+                    targeted feature refinements tracking energy drops and syllable normalization.
                 </td>
             </tr>
         </tbody>
@@ -98,12 +165,22 @@
 
     <h2>4. Summary of Markdown Files</h2>
     <ul>
-        <li><strong>RUNLOG.md</strong>: Contains the exhaustive record of the <em>Step 5 Error-Driven Feature Iterations</em>. Details three precise attempts at improving the model based on worst-case error analysis (adjusting filler energy thresholds, refocusing energy decay windows, and fixing fallback length ratios).</li>
-        <li><strong>NOTES.md</strong>: Summarizes (max 10 sentences) the dominant discriminative signals the model learned, identifies standard failure cases (mid-utterance cutoff logic), and outlines the future roadmap (speaker normalization, temporal modeling).</li>
+        <li><strong>RUNLOG.md</strong>: Contains the exhaustive record of the <em>Step 5 Error-Driven Feature
+                Iterations</em>. Details three precise attempts at improving the model based on worst-case error
+            analysis (adjusting filler energy thresholds, refocusing energy decay windows, and fixing fallback length
+            ratios).</li>
+        <li><strong>NOTES.md</strong>: Summarizes (max 10 sentences) the dominant discriminative signals the model
+            learned, identifies standard failure cases (mid-utterance cutoff logic), and outlines the future roadmap
+            (speaker normalization, temporal modeling).</li>
     </ul>
 
     <h2>5. Why This Beats the Status Quo</h2>
-    <p>Silence heuristics wait a fixed duration invariably. Our prosodic model reacts dynamically to standard conversational cues. By detecting sharp terminal energy decays or pronounced pre-boundary syllabic lengthening, the model gains the confidence to predict EOT rapidly (triggering faster response delays). Conversely, recognizing flat-pitch, flat-energy sustained voicing protects against mid-utterance conversational fillers ("ummm"), preventing false cutoffs.</p>
+    <p>Silence heuristics wait a fixed duration invariably. Our prosodic model reacts dynamically to standard
+        conversational cues. By detecting sharp terminal energy decays or pronounced pre-boundary syllabic lengthening,
+        the model gains the confidence to predict EOT rapidly (triggering faster response delays). Conversely,
+        recognizing flat-pitch, flat-energy sustained voicing protects against mid-utterance conversational fillers
+        ("ummm"), preventing false cutoffs.</p>
 
 </body>
+
 </html>
