@@ -231,8 +231,11 @@ def main():
         print(f"  val {lang}: {n_val} pauses")
 
     # ── train calibrated logistic regression ─────────────────────────────── #
-    print("\nFitting CalibratedClassifierCV(LogisticRegression) ...")
-    base = LogisticRegression(class_weight="balanced", max_iter=2000,
+    # class_weight=None (uniform): diagnostic showed 40/60 imbalance is mild
+    # enough that 'balanced' over-predicts EOT (~51% predicted vs ~38% actual),
+    # inflating false positives and reducing held-out accuracy.
+    print("\nFitting CalibratedClassifierCV(LogisticRegression, uniform weights) ...")
+    base = LogisticRegression(class_weight=None, max_iter=2000,
                                random_state=rs)
     clf = CalibratedClassifierCV(base, method="isotonic", cv=5)
     clf.fit(X_tr, y_tr)
