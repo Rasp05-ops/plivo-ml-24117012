@@ -17,3 +17,4 @@ eot_data/
 # prediction outputs
 *.csv
 *.log
+*.joblib
