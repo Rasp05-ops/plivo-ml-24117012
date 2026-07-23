@@ -1,6 +1,7 @@
 """predict.py — run EOT inference on a new, unseen data folder.
 
-Imports extract_features() and helpers from train.py (unchanged).
+Imports extract_features() and the causal accumulator loop from train_model.py
+(which in turn imports extract_features from train.py — unchanged).
 Does NOT require a 'label' column in labels.csv.
 
 Usage
@@ -13,21 +14,16 @@ Output
   predictions.csv with exactly three columns: turn_id, pause_index, p_eot
 """
 import argparse
-import csv
 import os
 import sys
-from collections import defaultdict
+import csv
 
 import joblib
 import numpy as np
 
-# ── import the validated feature extractor and helpers from train.py (unchanged) ──
-from train import (
-    extract_features,
-    _voiced_seg_durations,
-    HOP_S,
-)
-from features import load_wav, speech_before, f0_contour
+# load_data() contains the causal accumulator loop — single definition in
+# train_model.py, imported here so there is no copy-paste divergence risk.
+from train_model import load_data, FEATURE_NAMES, FEATURE_DIM
 
 
 def main():
@@ -46,14 +42,14 @@ def main():
             f"Run train_model.py first or pass --model <path>."
         )
     bundle = joblib.load(args.model)
-    model         = bundle["model"]
-    saved_names   = bundle["feature_names"]
-    saved_dim     = bundle["feature_dim"]
+    model       = bundle["model"]
+    saved_names = bundle["feature_names"]
+    saved_dim   = bundle["feature_dim"]
 
     # ── feature-order parity check ────────────────────────────────────────── #
-    # extract_features() is imported from train.py; saved_names from the bundle.
-    # If train.py changed since the model was saved, we catch it here.
-    from train_model import FEATURE_NAMES, FEATURE_DIM
+    # FEATURE_NAMES is imported from train_model.py — same object that was
+    # saved into the bundle at training time. If train.py's extract_features()
+    # ever changes its output order, the bundle will mismatch and we catch it.
     if saved_names != FEATURE_NAMES or saved_dim != FEATURE_DIM:
         sys.exit(
             f"FEATURE MISMATCH\n"
@@ -66,67 +62,20 @@ def main():
     if not os.path.isdir(args.data_dir):
         sys.exit(f"ERROR: data directory not found: '{args.data_dir}'")
 
-    labels_path = os.path.join(args.data_dir, "labels.csv")
-    if not os.path.exists(labels_path):
-        sys.exit(f"ERROR: labels.csv not found in '{args.data_dir}'")
-
-    rows = list(csv.DictReader(open(labels_path, newline="")))
-    if not rows:
-        sys.exit(f"ERROR: labels.csv in '{args.data_dir}' is empty")
-    # 'label' column is NOT required — predict.py works on unseen data
-    # that may not have ground-truth labels.
-
     print(f"data_dir : {os.path.abspath(args.data_dir)}")
     print(f"model    : {os.path.abspath(args.model)}"
-          f"  [{bundle.get('model_kind', '?')}, trained on {bundle.get('trained_on', [])}]")
+          f"  [trained on {bundle.get('trained_on', [])}]")
 
-    # ── causal accumulator loop — identical structure to train.py's main() ── #
-    turn_rows = defaultdict(list)
-    for r in rows:
-        turn_rows[r["turn_id"]].append(r)
-    for tid in turn_rows:
-        turn_rows[tid].sort(key=lambda r: int(r["pause_index"]))
+    # ── extract features — same loop as train_model.py, no copy-paste ─────── #
+    # require_label=False: predict.py works on data without ground-truth labels
+    X, y, groups, keys = load_data(args.data_dir, require_label=False)
+    print(f"pauses   : {len(keys)}  finite={np.all(np.isfinite(X))}")
 
-    cache = {}
-    X, keys = [], []
-
-    for tid, t_rows in turn_rows.items():
-        seg_durations   = []
-        voiced_s_so_far = 0.0
-        total_s_so_far  = 0.0
-
-        for pause_idx, r in enumerate(t_rows):
-            path = os.path.join(args.data_dir, r["audio_file"])
-            if path not in cache:
-                cache[path] = load_wav(path)
-            x_wav, sr = cache[path]
-            pause_start = float(r["pause_start"])
-
-            ctx = {
-                "pause_index"     : pause_idx,
-                "seg_durations"   : list(seg_durations),
-                "voiced_s_so_far" : voiced_s_so_far,
-                "total_s_so_far"  : total_s_so_far,
-            }
-            feat = extract_features(x_wav, sr, pause_start, ctx)
-            X.append(feat)
-            keys.append((r["turn_id"], r["pause_index"]))
-
-            # update context AFTER extracting — strictly causal
-            seg = speech_before(x_wav, sr, pause_start, window_s=1.5)
-            f0  = f0_contour(seg, sr)
-            seg_durations.extend(_voiced_seg_durations(f0))
-            voiced_s_so_far += float((f0 > 0).sum()) * HOP_S
-            total_s_so_far   = pause_start   # match train.py exactly
-
-    X_mat = np.array(X, dtype=np.float32)
-    print(f"pauses   : {len(keys)}  finite={np.all(np.isfinite(X_mat))}")
-
-    if len(X_mat) == 0:
+    if len(X) == 0:
         sys.exit("ERROR: no pauses found — nothing to predict.")
 
     # ── predict ───────────────────────────────────────────────────────────── #
-    p_eot = model.predict_proba(X_mat)[:, 1]
+    p_eot = model.predict_proba(X)[:, 1]
 
     # ── write output — exactly three columns, no extras ───────────────────── #
     with open(args.out, "w", newline="") as f:
