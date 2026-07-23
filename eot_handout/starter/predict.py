@@ -23,7 +23,8 @@ import numpy as np
 
 # load_data() contains the causal accumulator loop — single definition in
 # train_model.py, imported here so there is no copy-paste divergence risk.
-from train_model import load_data, FEATURE_NAMES, FEATURE_DIM
+# _drop_col15 must also be importable so joblib can unpickle the Pipeline.
+from train_model import load_data, FEATURE_NAMES, FEATURE_DIM, _drop_col15  # noqa: F401
 
 
 def main():

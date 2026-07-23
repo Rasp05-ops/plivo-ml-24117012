@@ -22,9 +22,10 @@ from collections import defaultdict
 
 import joblib
 import numpy as np
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GroupShuffleSplit
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import FunctionTransformer, StandardScaler
 
 # ── import the validated feature extractor and helpers from train.py (unchanged) ──
 from train import (
@@ -34,7 +35,9 @@ from train import (
 )
 from features import load_wav, speech_before, f0_contour
 
-# feature order must stay in sync with extract_features() in train.py
+# Features used — extract_features() returns 16; we drop col 15 (pause_start_s)
+# in the pipeline because it dominated the regression and prevented prosodic
+# features from being weighted correctly.
 FEATURE_NAMES = [
     "f0_slope_rel",        #  0
     "f0_rise_fall",        #  1
@@ -51,10 +54,16 @@ FEATURE_NAMES = [
     "f0_range_rel",        # 12
     "final_voiced_dur",    # 13
     "voiced_frame_count",  # 14
-    "pause_start_s",       # 15
+    # pause_start_s (col 15) dropped — see pipeline below
 ]
-FEATURE_DIM = 16
+FEATURE_DIM = 15   # features that enter the model (after dropping col 15)
+INPUT_DIM   = 16   # features returned by extract_features() / load_data()
 RANDOM_STATE = 42
+
+
+def _drop_col15(X):
+    """Drop column 15 (pause_start_s) from feature matrix. Module-level so joblib can pickle it."""
+    return X[:, :15]
 
 
 # ── data loader — same causal accumulator as train.py's main() ───────────── #
@@ -231,13 +240,16 @@ def main():
         print(f"  val {lang}: {n_val} pauses")
 
     # ── train calibrated logistic regression ─────────────────────────────── #
-    # class_weight=None (uniform): diagnostic showed 40/60 imbalance is mild
-    # enough that 'balanced' over-predicts EOT (~51% predicted vs ~38% actual),
-    # inflating false positives and reducing held-out accuracy.
-    print("\nFitting CalibratedClassifierCV(LogisticRegression, uniform weights) ...")
-    base = LogisticRegression(class_weight=None, max_iter=2000,
-                               random_state=rs)
-    clf = CalibratedClassifierCV(base, method="isotonic", cv=5)
+    # Pipeline: drop pause_start_s (col 15) → StandardScaler → LR(C=0.1)
+    # Scaler is fit on train split only; transform applied on val and predict.
+    # C=0.1 (stronger regularisation) chosen after held-out quick-test.
+    print("\nFitting Pipeline(drop_col15, StandardScaler, LR(C=0.1)) ...")
+    clf = Pipeline([
+        ("drop_col15", FunctionTransformer(_drop_col15)),
+        ("scaler",     StandardScaler()),
+        ("lr",         LogisticRegression(C=0.1, class_weight=None,
+                                          max_iter=2000, random_state=rs)),
+    ])
     clf.fit(X_tr, y_tr)
 
     p_va  = clf.predict_proba(X_va)[:, 1]
