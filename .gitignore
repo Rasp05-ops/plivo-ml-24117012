@@ -3,10 +3,17 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
 *.egg-info/
 dist/
 build/
 .DS_Store
+
+# audio data — do not push
+*.wav
+*.mp3
+*.flac
+eot_data/
+
+# prediction outputs
 *.csv
 *.log
